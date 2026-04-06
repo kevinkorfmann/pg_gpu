@@ -264,11 +264,15 @@ def ibs(genotype_matrix_or_haplotype_matrix,
 def ibs_v2(genotype_matrix_or_haplotype_matrix,
            population: Optional[Union[str, list]] = None,
            missing_data: str = 'include') -> np.ndarray:
-    """Compute pairwise IBS proportions using a fused CUDA kernel.
+    """Compute pairwise IBS proportions with fewer matrix multiplications.
 
-    Equivalent to ``ibs()`` but uses a single CUDA kernel with one thread
-    per individual pair instead of multiple matrix multiplications. Avoids
-    intermediate indicator matrices entirely.
+    Equivalent to ``ibs()`` but reduces 8 matmuls per chunk to 5 by
+    decomposing IBS via sum of squared genotype differences:
+
+        sum|g_i - g_j| = sum(g_i - g_j)^2 - 2 * n_diff2
+
+    where n_diff2 counts sites with |g_i - g_j| = 2, and
+    sum(g_i - g_j)^2 = (g^2)@v.T + v@(g^2).T - 2*(g@g.T).
 
     Parameters
     ----------
@@ -286,43 +290,48 @@ def ibs_v2(genotype_matrix_or_haplotype_matrix,
         Symmetric IBS matrix. Values in [0, 1] where 1 = identical.
         Diagonal is always 1.
     """
+    from ._memutil import estimate_variant_chunk_size
+
     hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,
                                       population)
     n_hap, n_var = hap.shape
+    chunk_size = estimate_variant_chunk_size(n_ind, bytes_per_element=8,
+                                             n_intermediates=4)
 
-    if missing_data == 'exclude':
-        valid_mask = cp.all(hap >= 0, axis=0)
-        hap = hap[:, valid_mask]
-        n_var = hap.shape[1]
+    gg = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+    g2v = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+    diff2 = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+    n_joint = cp.zeros((n_ind, n_ind), dtype=cp.float64)
 
-    hap = cp.ascontiguousarray(hap, dtype=cp.int8)
+    for start in range(0, n_var, chunk_size):
+        end = min(start + chunk_size, n_var)
+        h1 = hap[:n_ind, start:end]
+        h2 = hap[n_ind:, start:end]
+        valid = ((h1 >= 0) & (h2 >= 0)).astype(cp.float64)
+        g = (cp.maximum(h1, 0) + cp.maximum(h2, 0)).astype(cp.float64) * valid
 
-    n_pairs = int(n_ind) * (int(n_ind) - 1) // 2
-    if n_pairs == 0:
-        result = np.ones((n_ind, n_ind), dtype=np.float64)
-        return result
+        if missing_data == 'exclude':
+            site_complete = cp.all(valid > 0, axis=0)
+            valid = valid[:, site_complete]
+            g = g[:, site_complete]
 
-    ibs_sum = cp.zeros(n_pairs, dtype=cp.float64)
-    n_valid = cp.zeros(n_pairs, dtype=cp.int32)
+        gg += g @ g.T                       # matmul 1
+        g2v += (g * g) @ valid.T            # matmul 2
+        n_joint += valid @ valid.T           # matmul 3
+        a0 = (g == 0) * valid
+        a2 = (g == 2) * valid
+        diff2 += a0 @ a2.T + a2 @ a0.T     # matmul 4-5
+        del h1, h2, g, valid, a0, a2
 
-    threads = 256
-    blocks = (n_pairs + threads - 1) // threads
-
-    _ibs_fast_kernel(
-        (blocks,), (threads,),
-        (hap, ibs_sum, n_valid,
-         np.int32(n_ind), np.int32(n_var), np.int64(n_pairs))
-    )
-
-    # IBS proportion = sum(2 - |diff|) / (2 * n_valid)
-    n_valid_f = n_valid.astype(cp.float64)
-    ibs_condensed = cp.where(n_valid_f > 0, ibs_sum / (2.0 * n_valid_f), 0.0)
-
-    # Expand condensed vector to square matrix
-    ibs_mat = cp.ones((n_ind, n_ind), dtype=cp.float64)
-    idx_i, idx_j = cp.triu_indices(n_ind, k=1)
-    ibs_mat[idx_i, idx_j] = ibs_condensed
-    ibs_mat[idx_j, idx_i] = ibs_condensed
+    # sum(diff^2)[i,j] = g2v[i,j] + g2v[j,i] - 2*gg[i,j]
+    sum_sq = g2v + g2v.T - 2.0 * gg
+    # sum|diff| = sum(diff^2) - 2*diff2  (correct |2|^2=4 to |2|=2)
+    sum_abs = sum_sq - 2.0 * diff2
+    # IBS = (2*n_joint - sum|diff|) / (2*n_joint)
+    ibs_mat = cp.where(n_joint > 0,
+                        (2.0 * n_joint - sum_abs) / (2.0 * n_joint),
+                        0.0)
+    cp.fill_diagonal(ibs_mat, 1.0)
 
     return ibs_mat.get()
 
