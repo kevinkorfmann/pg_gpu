@@ -1,5 +1,6 @@
-"""Tests for pg_gpu.relatedness (GRM and IBS)."""
+"""Tests for pg_gpu.relatedness (GRM, IBS, and IBS longest segment)."""
 
+import time
 import numpy as np
 import pytest
 from pg_gpu import HaplotypeMatrix, relatedness
@@ -125,3 +126,151 @@ class TestIBS:
     def test_returns_numpy(self, small_haplotype_matrix):
         ibs_mat = relatedness.ibs(small_haplotype_matrix)
         assert isinstance(ibs_mat, np.ndarray)
+
+
+def _reference_ibs_longest_segment(hap):
+    """Naive NumPy reference: longest contiguous IBS per haplotype pair."""
+    n_hap, n_var = hap.shape
+    n_pairs = n_hap * (n_hap - 1) // 2
+    result = np.zeros(n_pairs, dtype=np.int32)
+    idx = 0
+    for i in range(n_hap):
+        for j in range(i + 1, n_hap):
+            max_run = 0
+            cur_run = 0
+            for s in range(n_var):
+                if hap[i, s] < 0 or hap[j, s] < 0:
+                    cur_run = 0
+                elif hap[i, s] == hap[j, s]:
+                    cur_run += 1
+                    if cur_run > max_run:
+                        max_run = cur_run
+                else:
+                    cur_run = 0
+            result[idx] = max_run
+            idx += 1
+    return result
+
+
+class TestIBSLongestSegment:
+    def test_output_shape(self, small_haplotype_matrix):
+        result = relatedness.ibs_longest_segment(small_haplotype_matrix)
+        n_hap = 6
+        n_pairs = n_hap * (n_hap - 1) // 2
+        assert result.shape == (n_pairs,)
+
+    def test_returns_numpy_int32(self, small_haplotype_matrix):
+        result = relatedness.ibs_longest_segment(small_haplotype_matrix)
+        assert isinstance(result, np.ndarray)
+        assert result.dtype == np.int32
+
+    def test_nonnegative(self, small_haplotype_matrix):
+        result = relatedness.ibs_longest_segment(small_haplotype_matrix)
+        assert np.all(result >= 0)
+
+    def test_matches_reference(self, small_haplotype_matrix):
+        result = relatedness.ibs_longest_segment(small_haplotype_matrix)
+        hap = small_haplotype_matrix.haplotypes
+        if hasattr(hap, 'get'):
+            hap = hap.get()
+        ref = _reference_ibs_longest_segment(hap)
+        np.testing.assert_array_equal(result, ref)
+
+    def test_matches_reference_larger(self):
+        np.random.seed(123)
+        hap = np.random.randint(0, 2, size=(40, 500)).astype(np.int8)
+        positions = np.arange(500) * 100
+        hm = HaplotypeMatrix(hap, positions)
+        result = relatedness.ibs_longest_segment(hm)
+        ref = _reference_ibs_longest_segment(hap)
+        np.testing.assert_array_equal(result, ref)
+
+    def test_identical_haplotypes(self):
+        hap = np.array([[0, 1, 0, 1, 1],
+                         [0, 1, 0, 1, 1]], dtype=np.int8)
+        hm = HaplotypeMatrix(hap, np.arange(5) * 100)
+        result = relatedness.ibs_longest_segment(hm)
+        assert result[0] == 5
+
+    def test_completely_different(self):
+        hap = np.array([[0, 0, 0, 0, 0],
+                         [1, 1, 1, 1, 1]], dtype=np.int8)
+        hm = HaplotypeMatrix(hap, np.arange(5) * 100)
+        result = relatedness.ibs_longest_segment(hm)
+        assert result[0] == 0
+
+    def test_single_match(self):
+        hap = np.array([[0, 1, 0, 1, 0],
+                         [1, 1, 1, 0, 1]], dtype=np.int8)
+        hm = HaplotypeMatrix(hap, np.arange(5) * 100)
+        result = relatedness.ibs_longest_segment(hm)
+        assert result[0] == 1
+
+    def test_known_segments(self):
+        # Match at positions 2,3,4 (run of 3), then mismatch, then match at 6 (run of 1)
+        hap = np.array([[0, 1, 0, 0, 0, 1, 1, 0],
+                         [1, 0, 0, 0, 0, 0, 1, 1]], dtype=np.int8)
+        hm = HaplotypeMatrix(hap, np.arange(8) * 100)
+        result = relatedness.ibs_longest_segment(hm)
+        assert result[0] == 3
+
+    def test_missing_data_breaks_run(self):
+        hap = np.array([[0, 0, 0, 0, 0],
+                         [0, 0, -1, 0, 0]], dtype=np.int8)
+        hm = HaplotypeMatrix(hap, np.arange(5) * 100)
+        result = relatedness.ibs_longest_segment(hm)
+        # Missing at position 2 breaks the run: max is 2 (positions 0-1 or 3-4)
+        assert result[0] == 2
+
+    def test_missing_data_exclude_mode(self):
+        hap = np.array([[0, 0, 0, 0, 0, 0],
+                         [0, 0, -1, 0, 0, 0]], dtype=np.int8)
+        hm = HaplotypeMatrix(hap, np.arange(6) * 100)
+        result = relatedness.ibs_longest_segment(hm, missing_data='exclude')
+        # After excluding site 2, remaining 5 sites all match -> run of 5
+        assert result[0] == 5
+
+    def test_multiple_pairs(self):
+        hap = np.array([[0, 0, 0, 0],   # hap 0
+                         [0, 0, 1, 1],   # hap 1
+                         [1, 1, 1, 1]], dtype=np.int8)  # hap 2
+        hm = HaplotypeMatrix(hap, np.arange(4) * 100)
+        result = relatedness.ibs_longest_segment(hm)
+        # Pair (0,1): match at 0,1 then differ -> 2
+        # Pair (0,2): all differ -> 0
+        # Pair (1,2): match at 2,3 -> 2
+        assert result[0] == 2  # (0,1)
+        assert result[1] == 0  # (0,2)
+        assert result[2] == 2  # (1,2)
+
+
+class TestIBSLongestSegmentPerformance:
+    @pytest.fixture
+    def large_dataset(self):
+        np.random.seed(42)
+        rng = np.random.default_rng(42)
+        n_haps, n_snps = 100, 50000
+        founders = rng.integers(0, 2, size=(5, n_snps), dtype=np.int8)
+        assignments = rng.integers(0, 5, size=n_haps)
+        haps = founders[assignments].copy()
+        mutations = rng.random(size=(n_haps, n_snps)) < 0.02
+        haps ^= mutations.astype(np.int8)
+        positions = np.arange(n_snps) * 100
+        return HaplotypeMatrix(haps, positions)
+
+    def test_performance(self, large_dataset):
+        # Warmup
+        relatedness.ibs_longest_segment(large_dataset)
+
+        times = []
+        for _ in range(5):
+            t0 = time.perf_counter()
+            relatedness.ibs_longest_segment(large_dataset)
+            t1 = time.perf_counter()
+            times.append(t1 - t0)
+        median_ms = np.median(times) * 1000
+
+        print(f"\nibs_longest_segment: 100 haplotypes x 50k variants")
+        print(f"  median: {median_ms:.2f} ms ({4950} pairs)")
+        # Should be well under 100ms for this size
+        assert median_ms < 100, f"Too slow: {median_ms:.1f} ms"

@@ -1,13 +1,105 @@
 """
 GPU-accelerated relatedness and kinship statistics.
 
-Provides GRM (Genetic Relationship Matrix) and IBS (Identity by State)
-sharing computed on GPU via CuPy matrix operations.
+Provides GRM (Genetic Relationship Matrix), IBS (Identity by State)
+sharing, and IBS longest segment computed on GPU via CuPy.
 """
 
 import numpy as np
 import cupy as cp
 from typing import Optional, Union
+
+
+# ---------------------------------------------------------------------------
+# CUDA kernel: longest contiguous IBS segment per haplotype pair
+# ---------------------------------------------------------------------------
+
+_ibs_longest_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void ibs_longest_kernel(
+    const signed char* __restrict__ hap,
+    int* __restrict__ max_run_out,
+    const int n_haps,
+    const int n_snps,
+    const long long n_pairs
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_pairs) return;
+
+    // Map linear pair index to (i, j) using triangular indexing
+    double tmp = (double)(2 * (long long)n_haps - 1);
+    double disc = tmp * tmp - 8.0 * (double)idx;
+    int i = (int)((tmp - sqrt(disc)) / 2.0);
+    while (i > 0 && (long long)i * ((long long)(2*n_haps - i - 1)) / 2 > idx) i--;
+    while ((long long)(i+1) * ((long long)(2*n_haps - i - 2)) / 2 <= idx) i++;
+    long long row_start = (long long)i * ((long long)(2*n_haps - i - 1)) / 2;
+    int j = (int)(idx - row_start) + i + 1;
+
+    int max_run = 0, cur_run = 0;
+    for (int s = 0; s < n_snps; s++) {
+        signed char ai = hap[i * n_snps + s];
+        signed char aj = hap[j * n_snps + s];
+        // Skip missing data: break the run
+        if (ai < 0 || aj < 0) {
+            cur_run = 0;
+        } else if (ai == aj) {
+            cur_run++;
+            if (cur_run > max_run) max_run = cur_run;
+        } else {
+            cur_run = 0;
+        }
+    }
+    max_run_out[idx] = max_run;
+}
+''', 'ibs_longest_kernel')
+
+
+_ibs_fast_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void ibs_fast_kernel(
+    const signed char* __restrict__ hap,  // (n_hap, n_var) row-major
+    double* __restrict__ ibs_sum,         // (n_pairs,) accumulates (2 - |g_i - g_j|)
+    int* __restrict__ n_valid,            // (n_pairs,) count of jointly valid sites
+    const int n_ind,
+    const int n_var,
+    const long long n_pairs
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_pairs) return;
+
+    // Map linear pair index to (i, j)
+    double tmp = (double)(2 * (long long)n_ind - 1);
+    double disc = tmp * tmp - 8.0 * (double)idx;
+    int i = (int)((tmp - sqrt(disc)) / 2.0);
+    while (i > 0 && (long long)i * ((long long)(2*n_ind - i - 1)) / 2 > idx) i--;
+    while ((long long)(i+1) * ((long long)(2*n_ind - i - 2)) / 2 <= idx) i++;
+    long long row_start = (long long)i * ((long long)(2*n_ind - i - 1)) / 2;
+    int j = (int)(idx - row_start) + i + 1;
+
+    double total = 0.0;
+    int valid = 0;
+
+    for (int s = 0; s < n_var; s++) {
+        // Build diploid genotypes inline: g = hap[ind] + hap[ind + n_ind]
+        signed char h1_i = hap[i * n_var + s];
+        signed char h2_i = hap[(i + n_ind) * n_var + s];
+        signed char h1_j = hap[j * n_var + s];
+        signed char h2_j = hap[(j + n_ind) * n_var + s];
+
+        if (h1_i < 0 || h2_i < 0 || h1_j < 0 || h2_j < 0) continue;
+
+        int gi = (int)h1_i + (int)h2_i;
+        int gj = (int)h1_j + (int)h2_j;
+        int diff = gi - gj;
+        if (diff < 0) diff = -diff;
+        total += (double)(2 - diff);
+        valid++;
+    }
+
+    ibs_sum[idx] = total;
+    n_valid[idx] = valid;
+}
+''', 'ibs_fast_kernel')
 
 
 def grm(genotype_matrix_or_haplotype_matrix,
@@ -167,6 +259,138 @@ def ibs(genotype_matrix_or_haplotype_matrix,
     cp.fill_diagonal(ibs_mat, 1.0)
 
     return ibs_mat.get()
+
+
+def ibs_v2(genotype_matrix_or_haplotype_matrix,
+           population: Optional[Union[str, list]] = None,
+           missing_data: str = 'include') -> np.ndarray:
+    """Compute pairwise IBS proportions with fewer matrix multiplications.
+
+    Equivalent to ``ibs()`` but reduces 8 matmuls per chunk to 5 by
+    decomposing IBS via sum of squared genotype differences:
+
+        sum|g_i - g_j| = sum(g_i - g_j)^2 - 2 * n_diff2
+
+    where n_diff2 counts sites with |g_i - g_j| = 2, and
+    sum(g_i - g_j)^2 = (g^2)@v.T + v@(g^2).T - 2*(g@g.T).
+
+    Parameters
+    ----------
+    genotype_matrix_or_haplotype_matrix : GenotypeMatrix or HaplotypeMatrix
+        Diploid genotypes (0/1/2) or haplotype data.
+    population : str or list, optional
+        Population subset.
+    missing_data : str
+        'include' - use jointly non-missing sites per pair.
+        'exclude' - restrict to sites with no missing data.
+
+    Returns
+    -------
+    ndarray, float64, shape (n_individuals, n_individuals)
+        Symmetric IBS matrix. Values in [0, 1] where 1 = identical.
+        Diagonal is always 1.
+    """
+    from ._memutil import estimate_variant_chunk_size
+
+    hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,
+                                      population)
+    n_hap, n_var = hap.shape
+    chunk_size = estimate_variant_chunk_size(n_ind, bytes_per_element=8,
+                                             n_intermediates=4)
+
+    gg = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+    g2v = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+    diff2 = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+    n_joint = cp.zeros((n_ind, n_ind), dtype=cp.float64)
+
+    for start in range(0, n_var, chunk_size):
+        end = min(start + chunk_size, n_var)
+        h1 = hap[:n_ind, start:end]
+        h2 = hap[n_ind:, start:end]
+        valid = ((h1 >= 0) & (h2 >= 0)).astype(cp.float64)
+        g = (cp.maximum(h1, 0) + cp.maximum(h2, 0)).astype(cp.float64) * valid
+
+        if missing_data == 'exclude':
+            site_complete = cp.all(valid > 0, axis=0)
+            valid = valid[:, site_complete]
+            g = g[:, site_complete]
+
+        gg += g @ g.T                       # matmul 1
+        g2v += (g * g) @ valid.T            # matmul 2
+        n_joint += valid @ valid.T           # matmul 3
+        a0 = (g == 0) * valid
+        a2 = (g == 2) * valid
+        diff2 += a0 @ a2.T + a2 @ a0.T     # matmul 4-5
+        del h1, h2, g, valid, a0, a2
+
+    # sum(diff^2)[i,j] = g2v[i,j] + g2v[j,i] - 2*gg[i,j]
+    sum_sq = g2v + g2v.T - 2.0 * gg
+    # sum|diff| = sum(diff^2) - 2*diff2  (correct |2|^2=4 to |2|=2)
+    sum_abs = sum_sq - 2.0 * diff2
+    # IBS = (2*n_joint - sum|diff|) / (2*n_joint)
+    ibs_mat = cp.where(n_joint > 0,
+                        (2.0 * n_joint - sum_abs) / (2.0 * n_joint),
+                        0.0)
+    cp.fill_diagonal(ibs_mat, 1.0)
+
+    return ibs_mat.get()
+
+
+def ibs_longest_segment(genotype_matrix_or_haplotype_matrix,
+                        population: Optional[Union[str, list]] = None,
+                        missing_data: str = 'include') -> np.ndarray:
+    """Compute longest contiguous IBS segment per haplotype pair.
+
+    For each pair of haplotypes, finds the longest run of consecutive
+    sites where both haplotypes carry the same allele. This is computed
+    on GPU using a custom CUDA kernel with one thread per pair.
+
+    Parameters
+    ----------
+    genotype_matrix_or_haplotype_matrix : GenotypeMatrix or HaplotypeMatrix
+        Haplotype data. If a GenotypeMatrix is provided, its underlying
+        haplotype representation is used directly (each diploid individual
+        contributes two haplotypes).
+    population : str or list, optional
+        Population subset.
+    missing_data : str
+        'include' - missing sites (-1) break the current run but do not
+        disqualify the pair. 'exclude' - restrict to sites with no
+        missing data across all haplotypes before computing.
+
+    Returns
+    -------
+    ndarray, int32, shape (n_pairs,)
+        Condensed vector of longest segment lengths (in number of
+        consecutive matching sites). Pair ordering follows
+        scipy.spatial.distance.squareform convention: pairs are
+        (0,1), (0,2), ..., (0,n-1), (1,2), ..., (n-2,n-1).
+    """
+    hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,
+                                      population)
+    n_haps, n_snps = hap.shape
+
+    if missing_data == 'exclude':
+        valid_mask = cp.all(hap >= 0, axis=0)
+        hap = hap[:, valid_mask]
+        n_snps = hap.shape[1]
+
+    # Ensure contiguous row-major int8 layout
+    hap = cp.ascontiguousarray(hap, dtype=cp.int8)
+
+    n_pairs = int(n_haps) * (int(n_haps) - 1) // 2
+    max_run_out = cp.zeros(n_pairs, dtype=cp.int32)
+
+    threads = 256
+    blocks = (n_pairs + threads - 1) // threads
+
+    _ibs_longest_kernel(
+        (blocks,), (threads,),
+        (hap, max_run_out,
+         np.int32(n_haps), np.int32(n_snps), np.int64(n_pairs))
+    )
+
+    return max_run_out.get()
 
 
 # ---------------------------------------------------------------------------
