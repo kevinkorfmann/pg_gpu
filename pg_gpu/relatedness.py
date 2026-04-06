@@ -1,13 +1,57 @@
 """
 GPU-accelerated relatedness and kinship statistics.
 
-Provides GRM (Genetic Relationship Matrix) and IBS (Identity by State)
-sharing computed on GPU via CuPy matrix operations.
+Provides GRM (Genetic Relationship Matrix), IBS (Identity by State)
+sharing, and IBS longest segment computed on GPU via CuPy.
 """
 
 import numpy as np
 import cupy as cp
 from typing import Optional, Union
+
+
+# ---------------------------------------------------------------------------
+# CUDA kernel: longest contiguous IBS segment per haplotype pair
+# ---------------------------------------------------------------------------
+
+_ibs_longest_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void ibs_longest_kernel(
+    const signed char* __restrict__ hap,
+    int* __restrict__ max_run_out,
+    const int n_haps,
+    const int n_snps,
+    const long long n_pairs
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_pairs) return;
+
+    // Map linear pair index to (i, j) using triangular indexing
+    double tmp = (double)(2 * (long long)n_haps - 1);
+    double disc = tmp * tmp - 8.0 * (double)idx;
+    int i = (int)((tmp - sqrt(disc)) / 2.0);
+    while (i > 0 && (long long)i * ((long long)(2*n_haps - i - 1)) / 2 > idx) i--;
+    while ((long long)(i+1) * ((long long)(2*n_haps - i - 2)) / 2 <= idx) i++;
+    long long row_start = (long long)i * ((long long)(2*n_haps - i - 1)) / 2;
+    int j = (int)(idx - row_start) + i + 1;
+
+    int max_run = 0, cur_run = 0;
+    for (int s = 0; s < n_snps; s++) {
+        signed char ai = hap[i * n_snps + s];
+        signed char aj = hap[j * n_snps + s];
+        // Skip missing data: break the run
+        if (ai < 0 || aj < 0) {
+            cur_run = 0;
+        } else if (ai == aj) {
+            cur_run++;
+            if (cur_run > max_run) max_run = cur_run;
+        } else {
+            cur_run = 0;
+        }
+    }
+    max_run_out[idx] = max_run;
+}
+''', 'ibs_longest_kernel')
 
 
 def grm(genotype_matrix_or_haplotype_matrix,
@@ -167,6 +211,63 @@ def ibs(genotype_matrix_or_haplotype_matrix,
     cp.fill_diagonal(ibs_mat, 1.0)
 
     return ibs_mat.get()
+
+
+def ibs_longest_segment(genotype_matrix_or_haplotype_matrix,
+                        population: Optional[Union[str, list]] = None,
+                        missing_data: str = 'include') -> np.ndarray:
+    """Compute longest contiguous IBS segment per haplotype pair.
+
+    For each pair of haplotypes, finds the longest run of consecutive
+    sites where both haplotypes carry the same allele. This is computed
+    on GPU using a custom CUDA kernel with one thread per pair.
+
+    Parameters
+    ----------
+    genotype_matrix_or_haplotype_matrix : GenotypeMatrix or HaplotypeMatrix
+        Haplotype data. If a GenotypeMatrix is provided, its underlying
+        haplotype representation is used directly (each diploid individual
+        contributes two haplotypes).
+    population : str or list, optional
+        Population subset.
+    missing_data : str
+        'include' - missing sites (-1) break the current run but do not
+        disqualify the pair. 'exclude' - restrict to sites with no
+        missing data across all haplotypes before computing.
+
+    Returns
+    -------
+    ndarray, int32, shape (n_pairs,)
+        Condensed vector of longest segment lengths (in number of
+        consecutive matching sites). Pair ordering follows
+        scipy.spatial.distance.squareform convention: pairs are
+        (0,1), (0,2), ..., (0,n-1), (1,2), ..., (n-2,n-1).
+    """
+    hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,
+                                      population)
+    n_haps, n_snps = hap.shape
+
+    if missing_data == 'exclude':
+        valid_mask = cp.all(hap >= 0, axis=0)
+        hap = hap[:, valid_mask]
+        n_snps = hap.shape[1]
+
+    # Ensure contiguous row-major int8 layout
+    hap = cp.ascontiguousarray(hap, dtype=cp.int8)
+
+    n_pairs = int(n_haps) * (int(n_haps) - 1) // 2
+    max_run_out = cp.zeros(n_pairs, dtype=cp.int32)
+
+    threads = 256
+    blocks = (n_pairs + threads - 1) // threads
+
+    _ibs_longest_kernel(
+        (blocks,), (threads,),
+        (hap, max_run_out,
+         np.int32(n_haps), np.int32(n_snps), np.int64(n_pairs))
+    )
+
+    return max_run_out.get()
 
 
 # ---------------------------------------------------------------------------
