@@ -54,6 +54,54 @@ void ibs_longest_kernel(
 ''', 'ibs_longest_kernel')
 
 
+_ibs_fast_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void ibs_fast_kernel(
+    const signed char* __restrict__ hap,  // (n_hap, n_var) row-major
+    double* __restrict__ ibs_sum,         // (n_pairs,) accumulates (2 - |g_i - g_j|)
+    int* __restrict__ n_valid,            // (n_pairs,) count of jointly valid sites
+    const int n_ind,
+    const int n_var,
+    const long long n_pairs
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_pairs) return;
+
+    // Map linear pair index to (i, j)
+    double tmp = (double)(2 * (long long)n_ind - 1);
+    double disc = tmp * tmp - 8.0 * (double)idx;
+    int i = (int)((tmp - sqrt(disc)) / 2.0);
+    while (i > 0 && (long long)i * ((long long)(2*n_ind - i - 1)) / 2 > idx) i--;
+    while ((long long)(i+1) * ((long long)(2*n_ind - i - 2)) / 2 <= idx) i++;
+    long long row_start = (long long)i * ((long long)(2*n_ind - i - 1)) / 2;
+    int j = (int)(idx - row_start) + i + 1;
+
+    double total = 0.0;
+    int valid = 0;
+
+    for (int s = 0; s < n_var; s++) {
+        // Build diploid genotypes inline: g = hap[ind] + hap[ind + n_ind]
+        signed char h1_i = hap[i * n_var + s];
+        signed char h2_i = hap[(i + n_ind) * n_var + s];
+        signed char h1_j = hap[j * n_var + s];
+        signed char h2_j = hap[(j + n_ind) * n_var + s];
+
+        if (h1_i < 0 || h2_i < 0 || h1_j < 0 || h2_j < 0) continue;
+
+        int gi = (int)h1_i + (int)h2_i;
+        int gj = (int)h1_j + (int)h2_j;
+        int diff = gi - gj;
+        if (diff < 0) diff = -diff;
+        total += (double)(2 - diff);
+        valid++;
+    }
+
+    ibs_sum[idx] = total;
+    n_valid[idx] = valid;
+}
+''', 'ibs_fast_kernel')
+
+
 def grm(genotype_matrix_or_haplotype_matrix,
         population: Optional[Union[str, list]] = None,
         missing_data: str = 'include') -> np.ndarray:
@@ -209,6 +257,72 @@ def ibs(genotype_matrix_or_haplotype_matrix,
                         (2.0 * ibs2 + ibs1) / (2.0 * n_joint),
                         0.0)
     cp.fill_diagonal(ibs_mat, 1.0)
+
+    return ibs_mat.get()
+
+
+def ibs_v2(genotype_matrix_or_haplotype_matrix,
+           population: Optional[Union[str, list]] = None,
+           missing_data: str = 'include') -> np.ndarray:
+    """Compute pairwise IBS proportions using a fused CUDA kernel.
+
+    Equivalent to ``ibs()`` but uses a single CUDA kernel with one thread
+    per individual pair instead of multiple matrix multiplications. Avoids
+    intermediate indicator matrices entirely.
+
+    Parameters
+    ----------
+    genotype_matrix_or_haplotype_matrix : GenotypeMatrix or HaplotypeMatrix
+        Diploid genotypes (0/1/2) or haplotype data.
+    population : str or list, optional
+        Population subset.
+    missing_data : str
+        'include' - use jointly non-missing sites per pair.
+        'exclude' - restrict to sites with no missing data.
+
+    Returns
+    -------
+    ndarray, float64, shape (n_individuals, n_individuals)
+        Symmetric IBS matrix. Values in [0, 1] where 1 = identical.
+        Diagonal is always 1.
+    """
+    hap, n_ind = _get_haplotype_data(genotype_matrix_or_haplotype_matrix,
+                                      population)
+    n_hap, n_var = hap.shape
+
+    if missing_data == 'exclude':
+        valid_mask = cp.all(hap >= 0, axis=0)
+        hap = hap[:, valid_mask]
+        n_var = hap.shape[1]
+
+    hap = cp.ascontiguousarray(hap, dtype=cp.int8)
+
+    n_pairs = int(n_ind) * (int(n_ind) - 1) // 2
+    if n_pairs == 0:
+        result = np.ones((n_ind, n_ind), dtype=np.float64)
+        return result
+
+    ibs_sum = cp.zeros(n_pairs, dtype=cp.float64)
+    n_valid = cp.zeros(n_pairs, dtype=cp.int32)
+
+    threads = 256
+    blocks = (n_pairs + threads - 1) // threads
+
+    _ibs_fast_kernel(
+        (blocks,), (threads,),
+        (hap, ibs_sum, n_valid,
+         np.int32(n_ind), np.int32(n_var), np.int64(n_pairs))
+    )
+
+    # IBS proportion = sum(2 - |diff|) / (2 * n_valid)
+    n_valid_f = n_valid.astype(cp.float64)
+    ibs_condensed = cp.where(n_valid_f > 0, ibs_sum / (2.0 * n_valid_f), 0.0)
+
+    # Expand condensed vector to square matrix
+    ibs_mat = cp.ones((n_ind, n_ind), dtype=cp.float64)
+    idx_i, idx_j = cp.triu_indices(n_ind, k=1)
+    ibs_mat[idx_i, idx_j] = ibs_condensed
+    ibs_mat[idx_j, idx_i] = ibs_condensed
 
     return ibs_mat.get()
 
